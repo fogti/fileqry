@@ -3,6 +3,7 @@ name = "fileqry"
 version = "0.0.0"
 authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
+license = "Apache-2.0 OR MIT"
 
 [dependencies]
 crossbeam-channel = "0.4"
