@@ -1,6 +1,7 @@
 use crossbeam_channel as chan;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use tracing::{debug, trace, info, warn, error, span, Level};
 
 pub trait FileWatcher {
     fn watch(&self, path: &Path);
@@ -12,12 +13,13 @@ pub trait VfsDb: salsa::Database + FileWatcher {
 }
 
 fn read(db: &impl VfsDb, path: PathBuf) -> Option<String> {
+    let span = span!(Level::DEBUG, "read", "{}", path.display());
+    let _enter = span.enter();
     db.salsa_runtime()
         .report_synthetic_read(salsa::Durability::LOW);
     db.watch(&path);
-    println!("(vfsdb)\tperform read of '{}'", path.display());
     let data = std::fs::read_to_string(&path).ok();
-    println!("(vfsdb)\t\tdata = {:?}", data);
+    debug!("{:?}", data);
     data
 }
 
@@ -39,56 +41,61 @@ struct ModifyInfo {
 /// - paths_r: receiver for paths which should be watched
 /// - inv_s: sender for paths which are invalidated
 fn mangle_and_watch(paths_r: chan::Receiver<PathBuf>, inv_s: chan::Sender<PathBuf>) {
-    let (modevs_s, modevs_r) = chan::bounded(1);
+    let (modevs_s, modevs_r) = chan::bounded(2);
     let mut watcher =
-        notify::immediate_watcher(move |ex: Result<notify::Event, notify::Error>| match ex {
-            Err(e) => eprintln!("(watcher runtime)\tgot error: {:?}", e),
-            Ok(mut event) => {
-                use notify::event::*;
-                println!("(watcher runtime)\tdebug: event = {:?}", event);
-                let is_direct = match &event.kind {
-                    EventKind::Any => {
-                        eprintln!(
-                            "(watcher runtime)\twarning: got 'any' event (paths = {:?})",
-                            event.paths
-                        );
-                        false
-                    }
-                    EventKind::Create(CreateKind::File)
-                    | EventKind::Modify(ModifyKind::Data(_))
-                    | EventKind::Remove(RemoveKind::File) => true,
-                    EventKind::Create(CreateKind::Any)
-                    | EventKind::Modify(_)
-                    | EventKind::Remove(RemoveKind::Any)
-                    | EventKind::Remove(RemoveKind::Folder) => false,
-                    // irrelevant event
-                    _ => return,
-                };
-
-                let _ = modevs_s.send(ModifyInfo {
-                    paths: std::mem::take(&mut event.paths),
-                    is_direct,
-                });
+        notify::immediate_watcher(move |ex: Result<notify::Event, notify::Error>| {
+            let span = span!(Level::DEBUG, "(watch runtime)");
+            let _enter = span.enter();
+            match ex {
+                Err(e) => error!("{:?}", e),
+                Ok(mut event) => {
+                    use notify::event::*;
+                    trace!("{:?}", event);
+                    let is_direct = match &event.kind {
+                        EventKind::Any => {
+                            warn!(
+                                "got 'any' event on paths = {:?}",
+                                event.paths
+                            );
+                            false
+                        }
+                        EventKind::Create(CreateKind::File)
+                        | EventKind::Modify(ModifyKind::Data(_))
+                        | EventKind::Remove(RemoveKind::File) => true,
+                        EventKind::Create(CreateKind::Any)
+                        | EventKind::Modify(_)
+                        | EventKind::Remove(RemoveKind::Any)
+                        | EventKind::Remove(RemoveKind::Folder) => false,
+                        // irrelevant event
+                        _ => return,
+                    };
+                    let _ = modevs_s.send(ModifyInfo {
+                        paths: std::mem::take(&mut event.paths),
+                        is_direct,
+                    });
+                }
             }
         })
-        .expect("(mangler)\terror: unable to initialize watcher");
+        .expect("mangler: unable to initialize watcher");
     use notify::Watcher;
     let _ = watcher.configure(notify::Config::PreciseEvents(true));
     let mut wset = HashSet::new();
     let drecurm = notify::RecursiveMode::NonRecursive;
+    let span = span!(Level::DEBUG, "(mangler)");
+    let _enter = span.enter();
     loop {
-        println!("(mangler)\tdebug: wset = {:?}", wset);
+        trace!("wset = {:?}", wset);
         chan::select! {
             recv(paths_r) -> path => {
                 if !path.is_ok() {
-                    eprintln!("(mangler)\twarning: input data channel closed");
+                    warn!("input data channel closed");
                     return;
                 }
                 let path = path.unwrap();
                 for i in [path.parent(), Some(&path)].iter().filter_map(|i| *i) {
                     if wset.insert(i.to_path_buf()) {
                         if let Err(e) = watcher.watch(i, drecurm) {
-                            eprintln!("(mangler)\tgot error: {:?}", e);
+                            error!("{:?}", e);
                             if let notify::ErrorKind::PathNotFound = e.kind {
                                 wset.remove(i);
                                 break;
@@ -98,24 +105,24 @@ fn mangle_and_watch(paths_r: chan::Receiver<PathBuf>, inv_s: chan::Sender<PathBu
                 }
             },
             recv(modevs_r) -> modev => {
-                let modev = modev.expect("(mangler)\terror: watcher disappeared!");
-                println!("(mangler)\tdebug: modev = {:?}", modev);
+                let modev = modev.expect("mangler: watcher disappeared!");
+                trace!("modev = {:?}", modev);
                 let selected_paths = if modev.is_direct {
                     modev.paths
                 } else {
                     wset.iter().filter(|i| modev.paths.iter().any(|j| i.starts_with(j))).map(PathBuf::from).collect::<Vec<_>>()
                 };
-                println!("(mangler)\tdebug: selected_paths = {:?}", selected_paths);
+                debug!("selected_paths = {:?}", selected_paths);
                 for i in selected_paths {
                     if !wset.remove(&i) {
                         continue;
                     }
                     if let Err(e) = watcher.unwatch(&i) {
-                        eprintln!("(mangler)\twarning: unwatch failed: {:?}", e);
+                        warn!("unwatch failed: {:?}", e);
                     }
                     if inv_s.send(i).is_err() {
                         // the main data channel is closed
-                        eprintln!("(mangler)\twarning: output data channel closed");
+                        warn!("output data channel closed");
                         return;
                     }
                 }
@@ -143,23 +150,19 @@ impl FileWatcher for MyDatabase {
             }))
         }
 
+        let span = span!(Level::DEBUG, "watch", "{}", path.display());
+        let _enter = span.enter();
+
         let absp = match absolute_path(path) {
-            Err(x) => {
-                eprintln!(
-                    "(fwatch api)\twarning: {}: absolute_path failed: {:?}",
-                    path.display(),
-                    x
-                );
+            Err(e) => {
+                error!("absolute_path failed: {:?}", e);
                 return;
             }
             Ok(x) => x,
         };
 
         if self.paths_s.send(absp.clone()).is_err() {
-            eprintln!(
-                "(fwatch api)\twarning: {}: watch (channel send) failed",
-                path.display()
-            );
+            error!("channel send failed");
         } else {
             self.trm
                 .borrow_mut()
@@ -189,8 +192,10 @@ impl MyDatabase {
     /// or before the next query
     pub fn process_events(&mut self) {
         let evs: Vec<_> = self.inv_r.try_iter().collect();
+        let span = span!(Level::DEBUG, "process_events");
+        let _enter = span.enter();
         for path in evs {
-            println!("(fwatch api)\tnotice: {}: file changed", path.display());
+            info!("{}: file changed", path.display());
             if let Some(x) = self.trm.get_mut().remove(&path) {
                 for i in x {
                     salsa::Database::query_mut(self, ReadQuery).invalidate(&i);
