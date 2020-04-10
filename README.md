@@ -7,14 +7,14 @@ A 'salsa' file query example with (batched) cache invalidation.
 1. open two terminal windows
 
 2. execute in the first window:
-   ```
+   ```sh
    git clone https://github.com/zserik/fileqry.git
    cd fileqry
    RUST_LOG="warn,fileqry=trace" cargo run
    ```
 
 3. in the second window
-   ```
+   ```sh
    cd fileqry
    rm test.txt
    cat >> test.txt
