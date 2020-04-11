@@ -22,14 +22,6 @@ pub trait VfsDb: salsa::Database + FileWatcher {
     }
 }
 
-#[salsa::database(VfsDbStorage)]
-pub struct MyDatabase {
-    runtime: salsa::Runtime<MyDatabase>,
-    paths_s: chan::Sender<PathBuf>,
-    inv_r: chan::Receiver<PathBuf>,
-    trm: std::cell::RefCell<HashMap<PathBuf, HashSet<PathBuf>>>,
-}
-
 #[derive(Debug)]
 struct ModifyInfo {
     paths: Vec<PathBuf>,
@@ -37,118 +29,17 @@ struct ModifyInfo {
     is_direct: bool,
 }
 
-struct Mangler<W> {
-    watcher: W,
+struct ManglerX {
+    watcher: notify::RecommendedWatcher,
+    trm: HashMap<PathBuf, HashSet<PathBuf>>,
     wset: HashSet<PathBuf>,
-    inv_s: chan::Sender<PathBuf>,
 }
 
-impl<W: notify::Watcher> Mangler<W> {
-    fn subscribe_path(&mut self, path: PathBuf) {
-        let span = span!(Level::DEBUG, "(mangler) subscribe_path");
-        let _enter = span.enter();
-        debug!("{}", path.display());
-        for i in [path.parent(), Some(&path)].iter().filter_map(|i| *i) {
-            if self.wset.insert(i.to_path_buf()) {
-                if let Err(e) = self.watcher.watch(i, notify::RecursiveMode::NonRecursive) {
-                    error!("{:?}", e);
-                    if let notify::ErrorKind::PathNotFound = e.kind {
-                        self.wset.remove(i);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_modev(&mut self, modev: ModifyInfo) {
-        let span = span!(Level::DEBUG, "(mangler) handle_modev");
-        let _enter = span.enter();
-        trace!("wset = {:?}, modev = {:?}", self.wset, modev);
-        let selected_paths = if modev.is_direct {
-            modev.paths
-        } else {
-            self.wset
-                .iter()
-                .filter(|i| modev.paths.iter().any(|j| i.starts_with(j)))
-                .map(PathBuf::from)
-                .collect::<Vec<_>>()
-        };
-        debug!("selected_paths = {:?}", selected_paths);
-        for i in selected_paths {
-            if !self.wset.remove(&i) {
-                continue;
-            }
-            if let Err(e) = self.watcher.unwatch(&i) {
-                warn!("unwatch failed: {:?}", e);
-            }
-            if self.inv_s.send(i).is_err() {
-                // the main data channel is closed
-                warn!("output data channel closed");
-                return;
-            }
-        }
-    }
-}
-
-/// - paths_r: receiver for paths which should be watched
-/// - inv_s: sender for paths which are invalidated
-fn mangle_and_watch(paths_r: chan::Receiver<PathBuf>, inv_s: chan::Sender<PathBuf>) {
-    let (modevs_s, modevs_r) = chan::bounded(2);
-    let mut watcher = notify::immediate_watcher(move |ex: Result<notify::Event, notify::Error>| {
-        let span = span!(Level::DEBUG, "(watch runtime)");
-        let _enter = span.enter();
-        match ex {
-            Err(e) => error!("{:?}", e),
-            Ok(mut event) => {
-                use notify::event::*;
-                trace!("{:?}", event);
-                let is_direct = match &event.kind {
-                    EventKind::Any => {
-                        warn!("got 'any' event on paths = {:?}", event.paths);
-                        false
-                    }
-                    EventKind::Create(CreateKind::File)
-                    | EventKind::Modify(ModifyKind::Data(_))
-                    | EventKind::Remove(RemoveKind::File) => true,
-                    EventKind::Create(CreateKind::Any)
-                    | EventKind::Modify(_)
-                    | EventKind::Remove(RemoveKind::Any)
-                    | EventKind::Remove(RemoveKind::Folder) => false,
-                    // irrelevant event
-                    _ => return,
-                };
-                let _ = modevs_s.send(ModifyInfo {
-                    paths: std::mem::take(&mut event.paths),
-                    is_direct,
-                });
-            }
-        }
-    })
-    .expect("mangler: unable to initialize watcher");
-    use notify::Watcher;
-    let _ = watcher.configure(notify::Config::PreciseEvents(true));
-
-    let mut mangler = Mangler {
-        watcher,
-        wset: HashSet::new(),
-        inv_s,
-    };
-    loop {
-        chan::select! {
-            recv(paths_r) -> path => {
-                match path {
-                    Err(_) => {
-                        warn!("(mangler) input data channel closed");
-                        break;
-                    },
-                    Ok(path) => mangler.subscribe_path(path),
-                }
-            },
-            recv(modevs_r) -> modev =>
-                mangler.handle_modev(modev.expect("mangler: watcher disappeared")),
-        }
-    }
+#[salsa::database(VfsDbStorage)]
+pub struct MyDatabase {
+    runtime: salsa::Runtime<MyDatabase>,
+    modevs_r: chan::Receiver<ModifyInfo>,
+    mangler: std::cell::RefCell<ManglerX>,
 }
 
 impl salsa::Database for MyDatabase {
@@ -170,10 +61,11 @@ impl FileWatcher for MyDatabase {
             }))
         }
 
-        let span = span!(Level::DEBUG, "watch", "{}", path.display());
+        let span = span!(Level::DEBUG, "watch");
         let _enter = span.enter();
 
-        let absp = match absolute_path(path) {
+        let orig_path = path;
+        let path = match absolute_path(path) {
             Err(e) => {
                 error!("absolute_path failed: {:?}", e);
                 return;
@@ -181,44 +73,128 @@ impl FileWatcher for MyDatabase {
             Ok(x) => x,
         };
 
-        if self.paths_s.send(absp.clone()).is_err() {
-            error!("channel send failed");
-        } else {
-            self.trm
-                .borrow_mut()
-                .entry(absp)
-                .or_default()
-                .insert(path.to_path_buf());
+        let mut mangler = self.mangler.borrow_mut();
+
+        debug!("{}", path.display());
+        for i in [path.parent(), Some(&path)].iter().filter_map(|i| *i) {
+            if mangler.wset.insert(i.to_path_buf()) {
+                use notify::Watcher;
+                if let Err(e) = mangler
+                    .watcher
+                    .watch(i, notify::RecursiveMode::NonRecursive)
+                {
+                    error!("{:?}", e);
+                    if let notify::ErrorKind::PathNotFound = e.kind {
+                        mangler.wset.remove(i);
+                        break;
+                    }
+                }
+            }
         }
+        mangler
+            .trm
+            .entry(path)
+            .or_default()
+            .insert(orig_path.to_path_buf());
     }
 }
 
 impl MyDatabase {
     pub fn new() -> Self {
-        let (paths_s, paths_r) = chan::bounded(1);
-        let (inv_s, inv_r) = chan::unbounded();
+        let (modevs_s, modevs_r) = chan::bounded(2);
+        let mut watcher =
+            notify::immediate_watcher(move |ex: Result<notify::Event, notify::Error>| {
+                let span = span!(Level::DEBUG, "(watch runtime)");
+                let _enter = span.enter();
+                match ex {
+                    Err(e) => error!("{:?}", e),
+                    Ok(mut event) => {
+                        use notify::event::*;
+                        trace!("{:?}", event);
+                        let is_direct = match &event.kind {
+                            EventKind::Any => {
+                                warn!("got 'any' event on paths = {:?}", event.paths);
+                                false
+                            }
+                            EventKind::Create(CreateKind::File)
+                            | EventKind::Modify(ModifyKind::Data(_))
+                            | EventKind::Remove(RemoveKind::File) => true,
+                            EventKind::Create(CreateKind::Any)
+                            | EventKind::Modify(_)
+                            | EventKind::Remove(RemoveKind::Any)
+                            | EventKind::Remove(RemoveKind::Folder) => false,
+                            // irrelevant event
+                            _ => return,
+                        };
+                        let _ = modevs_s.send(ModifyInfo {
+                            paths: std::mem::take(&mut event.paths),
+                            is_direct,
+                        });
+                    }
+                }
+            })
+            .expect("mangler: unable to initialize watcher");
+        use notify::Watcher;
+        let _ = watcher.configure(notify::Config::PreciseEvents(true));
 
-        std::thread::spawn(move || mangle_and_watch(paths_r, inv_s));
+        let mangler = std::cell::RefCell::new(ManglerX {
+            watcher,
+            trm: Default::default(),
+            wset: Default::default(),
+        });
 
         Self {
             runtime: Default::default(),
-            trm: Default::default(),
-            paths_s,
-            inv_r,
+            modevs_r,
+            mangler,
         }
     }
 
-    fn process_events_intern(&mut self, evs: impl std::iter::IntoIterator<Item = PathBuf>) {
-        let mut paths = Vec::new();
-        for path in evs {
-            info!("{}: file changed", path.display());
-            if let Some(x) = self.trm.get_mut().remove(&path) {
-                paths.extend(x.into_iter());
+    fn process_events_intern(
+        &mut self,
+        evs: impl std::iter::IntoIterator<Item = ModifyInfo> + std::fmt::Debug,
+    ) {
+        let span = span!(Level::DEBUG, "process_events_intern");
+        let _enter = span.enter();
+
+        let mangler = self.mangler.get_mut();
+        let mut selected_paths = HashSet::new();
+        let mut real_paths = Vec::new();
+
+        trace!("wset = {:?}, evs = {:?}", mangler.wset, evs);
+
+        for modev in evs {
+            selected_paths.extend(if modev.is_direct {
+                modev.paths
+            } else {
+                mangler
+                    .wset
+                    .iter()
+                    .filter(|i| modev.paths.iter().any(|j| i.starts_with(j)))
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
+            });
+        }
+
+        debug!("selected_paths = {:?}", selected_paths);
+
+        for i in selected_paths {
+            use notify::Watcher;
+            if !mangler.wset.remove(&i) {
+                continue;
+            }
+            info!("{}: file changed", i.display());
+            if let Err(e) = mangler.watcher.unwatch(&i) {
+                warn!("unwatch failed: {:?}", e);
+            }
+            if let Some(x) = mangler.trm.remove(&i) {
+                real_paths.extend(x.into_iter());
             }
         }
-        paths.sort();
-        paths.dedup();
-        for i in paths {
+
+        real_paths.sort();
+        real_paths.dedup();
+        for i in real_paths {
             salsa::Database::query_mut(self, ReadQuery).invalidate(&i);
         }
     }
@@ -229,7 +205,7 @@ impl MyDatabase {
     pub fn process_events(&mut self) {
         let span = span!(Level::DEBUG, "process_events");
         let _enter = span.enter();
-        self.process_events_intern(self.inv_r.try_iter().collect::<Vec<_>>());
+        self.process_events_intern(self.modevs_r.try_iter().collect::<Vec<_>>());
     }
 
     /// this method should be called while waiting (this method waits internally)
@@ -249,7 +225,7 @@ impl MyDatabase {
 
         loop {
             chan::select! {
-                recv(self.inv_r) -> maybe_path => match maybe_path {
+                recv(self.modevs_r) -> maybe_path => match maybe_path {
                     Err(_) => break,
                     Ok(path) => self.process_events_intern(vec![path]),
                 },
@@ -273,15 +249,18 @@ impl MyDatabase {
         let _enter = span.enter();
 
         // 1. wait for one new event
-        let first_ev = if let Ok(ev) = self.inv_r.recv() {
+        let first_ev = if let Ok(ev) = self.modevs_r.recv() {
             ev
         } else {
             return false;
         };
 
-        // 2. process events
+        // 2. wait for other events
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // 3. process events
         self.process_events_intern(
-            self.inv_r
+            self.modevs_r
                 .try_iter()
                 .chain(std::iter::once(first_ev))
                 .collect::<Vec<_>>(),
