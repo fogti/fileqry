@@ -12,3 +12,4 @@ path-clean = "0.1"
 salsa = "0.14"
 tracing = "0.1"
 tracing-subscriber = "0.2.4"
+salsa-inline-query = { git = "https://github.com/zuobaoquan/salsa-inline-query" }
